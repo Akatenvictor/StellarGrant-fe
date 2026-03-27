@@ -450,6 +450,34 @@ impl Events {
         };
         event.publish(env);
     }
+
+    pub fn emit_reviewer_delegated(
+        env: &Env,
+        grant_id: u64,
+        delegator: Address,
+        delegatee: Address,
+        expires_at: u64,
+    ) {
+        let event = ReviewerDelegated {
+            event_version: EVENT_VERSION,
+            grant_id,
+            delegator,
+            delegatee,
+            expires_at,
+            timestamp: env.ledger().timestamp(),
+        };
+        event.publish(env);
+    }
+
+    pub fn emit_delegation_revoked(env: &Env, grant_id: u64, delegator: Address) {
+        let event = DelegationRevoked {
+            event_version: EVENT_VERSION,
+            grant_id,
+            delegator,
+            timestamp: env.ledger().timestamp(),
+        };
+        event.publish(env);
+    }
 }
 
 #[contractevent]
@@ -458,5 +486,25 @@ pub struct MilestoneExpired {
     pub event_version: u32,
     pub grant_id: u64,
     pub milestone_idx: u32,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReviewerDelegated {
+    pub event_version: u32,
+    pub grant_id: u64,
+    pub delegator: Address,
+    pub delegatee: Address,
+    pub expires_at: u64,
+    pub timestamp: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationRevoked {
+    pub event_version: u32,
+    pub grant_id: u64,
+    pub delegator: Address,
     pub timestamp: u64,
 }

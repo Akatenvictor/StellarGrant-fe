@@ -1,4 +1,4 @@
-use crate::types::{EscrowLifecycleState, EscrowMode, EscrowState, Grant, Milestone};
+use crate::types::{DelegationInfo, EscrowLifecycleState, EscrowMode, EscrowState, Grant, Milestone};
 use soroban_sdk::{contracttype, Env};
 
 #[contracttype]
@@ -22,6 +22,8 @@ pub enum DataKey {
     MultisigSigners(u64),
     ReleaseSignerApproval(u64, soroban_sdk::Address),
     GrantMinReputation(u64),
+    /// Delegation: (delegator, grant_id) -> DelegationInfo
+    Delegation(soroban_sdk::Address, u64),
 }
 
 pub struct Storage;
@@ -239,5 +241,34 @@ impl Storage {
         env.storage()
             .persistent()
             .set(&DataKey::GrantMinReputation(grant_id), &min_reputation);
+    }
+
+    // --- Delegation helpers ---
+
+    pub fn get_delegation(
+        env: &Env,
+        delegator: &soroban_sdk::Address,
+        grant_id: u64,
+    ) -> Option<DelegationInfo> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegator.clone(), grant_id))
+    }
+
+    pub fn set_delegation(
+        env: &Env,
+        delegator: &soroban_sdk::Address,
+        grant_id: u64,
+        info: &DelegationInfo,
+    ) {
+        let key = DataKey::Delegation(delegator.clone(), grant_id);
+        env.storage().persistent().set(&key, info);
+        Self::bump_persistent_ttl(env, &key);
+    }
+
+    pub fn remove_delegation(env: &Env, delegator: &soroban_sdk::Address, grant_id: u64) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Delegation(delegator.clone(), grant_id));
     }
 }

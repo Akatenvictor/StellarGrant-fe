@@ -30,6 +30,8 @@ pub enum ContractError {
     ReleaseNotReady = 23,
     GrantAlreadyReleased = 24,
     InsufficientReputation = 25,
+    DelegationNotFound = 26,
+    DelegationExpired = 27,
 }
 
 #[contracttype]
@@ -144,4 +146,14 @@ pub struct ContributorProfile {
     pub reputation_score: u64,
     pub grants_count: u32,
     pub total_earned: i128,
+}
+
+/// Delegation info: a reviewer's delegated vote for a specific grant.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelegationInfo {
+    /// The address that will vote on behalf of the delegator.
+    pub delegatee: Address,
+    /// Ledger timestamp after which the delegation is no longer valid. 0 = never expires.
+    pub expires_at: u64,
 }

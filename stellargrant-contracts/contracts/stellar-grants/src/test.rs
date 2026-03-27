@@ -2738,4 +2738,154 @@ mod tests {
         );
         assert_eq!(result, Err(Ok(ContractError::InvalidInput.into())));
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Reviewer Delegation Tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_delegation_delegatee_can_vote() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, contract_id) = setup_test(&env);
+
+        let grant_id = 300u64;
+        let milestone_idx = 0u32;
+        let owner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let reviewer = Address::generate(&env); // the original reviewer
+        let delegatee = Address::generate(&env); // the trusted delegate
+
+        let mut reviewers = Vec::new(&env);
+        reviewers.push_back(reviewer.clone());
+        create_grant(&env, &contract_id, grant_id, owner, token, reviewers);
+        create_milestone(&env, &contract_id, grant_id, milestone_idx, MilestoneState::Submitted);
+
+        // Reviewer delegates their vote to delegatee for grant 300
+        client.grant_delegate(&reviewer, &delegatee, &grant_id, &0u64);
+
+        // Delegatee votes — should count as reviewer's vote and reach quorum (1/1)
+        let quorum_reached = client.milestone_vote(&grant_id, &milestone_idx, &delegatee, &true, &None);
+        assert_eq!(quorum_reached, true);
+
+        // The vote must be stored under the delegator's (reviewer's) address
+        env.as_contract(&contract_id, || {
+            let milestone = crate::storage::Storage::get_milestone(&env, grant_id, milestone_idx).unwrap();
+            assert!(milestone.votes.contains_key(reviewer.clone()));
+            assert!(!milestone.votes.contains_key(delegatee.clone()));
+            assert_eq!(milestone.state, MilestoneState::Approved);
+        });
+    }
+
+    #[test]
+    fn test_delegation_expired_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, contract_id) = setup_test(&env);
+
+        let grant_id = 301u64;
+        let milestone_idx = 0u32;
+        let owner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let delegatee = Address::generate(&env);
+
+        let mut reviewers = Vec::new(&env);
+        reviewers.push_back(reviewer.clone());
+        create_grant(&env, &contract_id, grant_id, owner, token, reviewers);
+        create_milestone(&env, &contract_id, grant_id, milestone_idx, MilestoneState::Submitted);
+
+        // Delegate with an already-expired timestamp
+        let past_time: u64 = 1; // ledger timestamp starts at 0 in tests
+        client.grant_delegate(&reviewer, &delegatee, &grant_id, &past_time);
+
+        // Advance the ledger so that the delegation is expired
+        env.ledger().set_timestamp(100);
+
+        // Delegatee attempts to vote — should fail with DelegationExpired
+        let result = client.try_milestone_vote(&grant_id, &milestone_idx, &delegatee, &true, &None);
+        assert_eq!(result, Err(Ok(ContractError::DelegationExpired.into())));
+    }
+
+    #[test]
+    fn test_delegation_revocation_blocks_vote() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, contract_id) = setup_test(&env);
+
+        let grant_id = 302u64;
+        let milestone_idx = 0u32;
+        let owner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let reviewer = Address::generate(&env);
+        let delegatee = Address::generate(&env);
+
+        let mut reviewers = Vec::new(&env);
+        reviewers.push_back(reviewer.clone());
+        create_grant(&env, &contract_id, grant_id, owner, token, reviewers);
+        create_milestone(&env, &contract_id, grant_id, milestone_idx, MilestoneState::Submitted);
+
+        // Set then immediately revoke the delegation
+        client.grant_delegate(&reviewer, &delegatee, &grant_id, &0u64);
+        client.grant_revoke_delegation(&reviewer, &grant_id);
+
+        // Delegatee attempts to vote — delegation is gone, should be Unauthorized
+        let result = client.try_milestone_vote(&grant_id, &milestone_idx, &delegatee, &true, &None);
+        assert_eq!(result, Err(Ok(ContractError::Unauthorized.into())));
+    }
+
+    #[test]
+    fn test_delegation_direct_reviewer_still_works() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, contract_id) = setup_test(&env);
+
+        let grant_id = 303u64;
+        let milestone_idx = 0u32;
+        let owner = Address::generate(&env);
+        let token = Address::generate(&env);
+        let reviewer1 = Address::generate(&env);
+        let reviewer2 = Address::generate(&env);
+        let delegatee = Address::generate(&env);
+
+        let mut reviewers = Vec::new(&env);
+        reviewers.push_back(reviewer1.clone());
+        reviewers.push_back(reviewer2.clone());
+
+        // Quorum = 2 for 2 reviewers
+        env.as_contract(&contract_id, || {
+            use crate::types::{Grant, GrantStatus};
+            let grant = Grant {
+                id: grant_id,
+                title: String::from_str(&env, "Delegation Test"),
+                description: String::from_str(&env, "Desc"),
+                milestone_amount: 500,
+                owner,
+                token,
+                status: GrantStatus::Active,
+                total_amount: 1000,
+                reviewers,
+                quorum: 2,
+                total_milestones: 1,
+                milestones_paid_out: 0,
+                escrow_balance: 1000,
+                funders: Vec::new(&env),
+                reason: None,
+                timestamp: env.ledger().timestamp(),
+            };
+            crate::storage::Storage::set_grant(&env, grant_id, &grant);
+        });
+        create_milestone(&env, &contract_id, grant_id, milestone_idx, MilestoneState::Submitted);
+
+        // reviewer2 delegates to delegatee
+        client.grant_delegate(&reviewer2, &delegatee, &grant_id, &0u64);
+
+        // reviewer1 votes directly (should work fine)
+        let r1 = client.milestone_vote(&grant_id, &milestone_idx, &reviewer1, &true, &None);
+        assert_eq!(r1, false); // quorum not yet reached
+
+        // delegatee votes on behalf of reviewer2 — should reach quorum
+        let r2 = client.milestone_vote(&grant_id, &milestone_idx, &delegatee, &true, &None);
+        assert_eq!(r2, true);
+    }
 }

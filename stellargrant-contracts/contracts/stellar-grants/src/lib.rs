@@ -9,8 +9,8 @@ mod types;
 pub use events::Events;
 pub use storage::Storage;
 pub use types::{
-    ContractError, EscrowLifecycleState, EscrowMode, EscrowState, Grant, GrantFund, GrantStatus,
-    Milestone, MilestoneState, MilestoneSubmission,
+    ContractError, DelegationInfo, EscrowLifecycleState, EscrowMode, EscrowState, Grant, GrantFund,
+    GrantStatus, Milestone, MilestoneState, MilestoneSubmission,
 };
 
 use soroban_sdk::{contract, contractimpl, token, Address, Env, String, Vec};
@@ -716,11 +716,31 @@ impl StellarGrantsContract {
             return Err(ContractError::MilestoneNotSubmitted);
         }
 
-        if !grant.reviewers.contains(reviewer.clone()) {
-            return Err(ContractError::Unauthorized);
-        }
+        // Determine the effective reviewer: caller may be voting on behalf of a delegator.
+        let effective_reviewer = if grant.reviewers.contains(reviewer.clone()) {
+            // Direct reviewer — no delegation needed.
+            reviewer.clone()
+        } else {
+            // Search for a reviewer who has delegated to this caller for this grant.
+            let mut found: Option<Address> = None;
+            for delegator in grant.reviewers.iter() {
+                if let Some(info) = Storage::get_delegation(&env, &delegator, grant_id) {
+                    if info.delegatee == reviewer {
+                        // Check expiry (0 = never expires).
+                        if info.expires_at != 0
+                            && env.ledger().timestamp() > info.expires_at
+                        {
+                            return Err(ContractError::DelegationExpired);
+                        }
+                        found = Some(delegator);
+                        break;
+                    }
+                }
+            }
+            found.ok_or(ContractError::Unauthorized)?
+        };
 
-        if milestone.votes.contains_key(reviewer.clone()) {
+        if milestone.votes.contains_key(effective_reviewer.clone()) {
             return Err(ContractError::AlreadyVoted);
         }
 
@@ -728,11 +748,11 @@ impl StellarGrantsContract {
             if fb.len() > 256 {
                 return Err(ContractError::InvalidInput);
             }
-            milestone.reasons.set(reviewer.clone(), fb.clone());
+            milestone.reasons.set(effective_reviewer.clone(), fb.clone());
         }
 
-        let reputation = Storage::get_reviewer_reputation(&env, reviewer.clone());
-        milestone.votes.set(reviewer.clone(), approve);
+        let reputation = Storage::get_reviewer_reputation(&env, effective_reviewer.clone());
+        milestone.votes.set(effective_reviewer.clone(), approve);
 
         if approve {
             milestone.approvals += reputation;
@@ -764,7 +784,14 @@ impl StellarGrantsContract {
         }
 
         Storage::set_milestone(&env, grant_id, milestone_idx, &milestone);
-        Events::milestone_voted(&env, grant_id, milestone_idx, reviewer, approve, feedback);
+        Events::milestone_voted(
+            &env,
+            grant_id,
+            milestone_idx,
+            effective_reviewer,
+            approve,
+            feedback,
+        );
 
         Ok(quorum_reached)
     }
@@ -1291,6 +1318,63 @@ impl StellarGrantsContract {
 
             Ok(())
         })
+    }
+
+    // ── Reviewer Delegation ─────────────────────────────────────────
+
+    /// Delegate voting power on a specific grant to another address.
+    ///
+    /// Only an address that is a listed reviewer on the grant can delegate.
+    /// Setting `expires_at` to 0 means the delegation never expires.
+    pub fn grant_delegate(
+        env: Env,
+        delegator: Address,
+        delegatee: Address,
+        grant_id: u64,
+        expires_at: u64,
+    ) -> Result<(), ContractError> {
+        delegator.require_auth();
+
+        let grant = Storage::get_grant(&env, grant_id).ok_or(ContractError::GrantNotFound)?;
+
+        // Only existing reviewers may delegate.
+        if !grant.reviewers.contains(delegator.clone()) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // A reviewer cannot delegate to themselves.
+        if delegator == delegatee {
+            return Err(ContractError::InvalidInput);
+        }
+
+        let info = DelegationInfo {
+            delegatee: delegatee.clone(),
+            expires_at,
+        };
+        Storage::set_delegation(&env, &delegator, grant_id, &info);
+
+        Events::emit_reviewer_delegated(&env, grant_id, delegator, delegatee, expires_at);
+        Ok(())
+    }
+
+    /// Revoke a previously set delegation for a grant.
+    ///
+    /// Only the original delegator can revoke their own delegation.
+    pub fn grant_revoke_delegation(
+        env: Env,
+        delegator: Address,
+        grant_id: u64,
+    ) -> Result<(), ContractError> {
+        delegator.require_auth();
+
+        // Ensure a delegation actually exists before revoking.
+        if Storage::get_delegation(&env, &delegator, grant_id).is_none() {
+            return Err(ContractError::DelegationNotFound);
+        }
+
+        Storage::remove_delegation(&env, &delegator, grant_id);
+        Events::emit_delegation_revoked(&env, grant_id, delegator);
+        Ok(())
     }
 }
 
