@@ -142,6 +142,10 @@ impl StellarGrantsContract {
     ) -> Result<u64, ContractError> {
         owner.require_auth();
 
+        if Storage::is_blacklisted(&env, &owner) {
+            return Err(ContractError::Blacklisted);
+        }
+
         if let Some(ref deadlines) = milestone_deadlines {
             if deadlines.len() != num_milestones {
                 return Err(ContractError::InvalidInput);
@@ -187,6 +191,8 @@ impl StellarGrantsContract {
             funders: soroban_sdk::Vec::new(&env),
             reason: None,
             timestamp: env.ledger().timestamp(),
+            // Heartbeat is initialised to creation time.
+            last_heartbeat: env.ledger().timestamp(),
         };
 
         Storage::set_grant(&env, grant_id, &grant);
@@ -339,6 +345,10 @@ impl StellarGrantsContract {
     ) -> Result<(), ContractError> {
         contributor.require_auth();
 
+        if Storage::is_blacklisted(&env, &contributor) {
+            return Err(ContractError::Blacklisted);
+        }
+
         if name.is_empty() || name.len() > 100 {
             return Err(ContractError::InvalidInput);
         }
@@ -393,12 +403,28 @@ impl StellarGrantsContract {
 
             let caller_is_owner = grant.owner == caller;
             let caller_is_admin = Storage::get_global_admin(&env) == Some(caller.clone());
-            if !caller_is_owner && !caller_is_admin {
-                return Err(ContractError::Unauthorized);
-            }
 
-            if grant.status != GrantStatus::Active {
-                return Err(ContractError::InvalidState);
+            // Any funder may cancel a grant that has gone Inactive (missed heartbeat).
+            let grant_is_inactive = grant.status == GrantStatus::Inactive;
+            let caller_is_funder = grant.funders.iter().any(|f| f.funder == caller);
+
+            if grant_is_inactive {
+                // If heartbeat missed by 2+ months (60 days), anyone can cancel.
+                const CANCEL_TIMEOUT: u64 = 60 * 24 * 60 * 60; // 60 days in seconds
+                let now = env.ledger().timestamp();
+                let is_overdue_2_months = grant.last_heartbeat > 0 && now > grant.last_heartbeat + CANCEL_TIMEOUT;
+
+                if !caller_is_owner && !caller_is_admin && !caller_is_funder && !is_overdue_2_months {
+                    return Err(ContractError::Unauthorized);
+                }
+            } else {
+                // Active grants: only owner or admin.
+                if !caller_is_owner && !caller_is_admin {
+                    return Err(ContractError::Unauthorized);
+                }
+                if grant.status != GrantStatus::Active {
+                    return Err(ContractError::InvalidState);
+                }
             }
 
             // Cannot cancel if all milestones are approved/paid out
@@ -642,7 +668,7 @@ impl StellarGrantsContract {
             }
         }
 
-        // Mark all approved milestones as paid
+        // Mark all approved milestones as paid and emit per-milestone payee receipts.
         for milestone_idx in 0..grant.total_milestones {
             if let Some(mut milestone) = Storage::get_milestone(env, grant_id, milestone_idx) {
                 if milestone.state == MilestoneState::Approved {
@@ -657,6 +683,16 @@ impl StellarGrantsContract {
                         MilestoneState::Paid,
                     );
                     Events::emit_milestone_paid(env, grant_id, milestone_idx, milestone.amount);
+
+                    // Emit a payee receipt so recipients can export official payout records.
+                    Events::emit_payee_receipt(
+                        env,
+                        grant_id,
+                        grant.owner.clone(),
+                        grant.token.clone(),
+                        milestone.amount,
+                        milestone_idx,
+                    );
                 }
             }
         }
@@ -707,6 +743,10 @@ impl StellarGrantsContract {
         feedback: Option<String>,
     ) -> Result<bool, ContractError> {
         reviewer.require_auth();
+
+        if Storage::is_blacklisted(&env, &reviewer) {
+            return Err(ContractError::Blacklisted);
+        }
 
         let grant = Storage::get_grant(&env, grant_id).ok_or(ContractError::GrantNotFound)?;
         let mut milestone = Storage::get_milestone(&env, grant_id, milestone_idx)
@@ -951,7 +991,15 @@ impl StellarGrantsContract {
     ) -> Result<(), ContractError> {
         recipient.require_auth();
 
+        if Storage::is_blacklisted(&env, &recipient) {
+            return Err(ContractError::Blacklisted);
+        }
+
         let grant = Storage::get_grant(&env, grant_id).ok_or(ContractError::GrantNotFound)?;
+
+        if grant.status == GrantStatus::Inactive {
+            return Err(ContractError::HeartbeatMissed);
+        }
 
         if grant.status != GrantStatus::Active {
             return Err(ContractError::InvalidState);
@@ -1027,6 +1075,8 @@ impl StellarGrantsContract {
     /// * `grant_id` - The unique identifier of the grant.
     /// * `funder` - The address of the entity sending funds.
     /// * `amount` - The amount of tokens to deposit.
+    /// * `memo` - Optional human-readable note (e.g. invoice reference) for accounting.
+    ///   Included verbatim in the [`PayerReceipt`] event for easy export.
     ///
     /// # Errors
     /// * [`ContractError::InvalidInput`] – if `amount <= 0` or if addition overflows.
@@ -1037,6 +1087,7 @@ impl StellarGrantsContract {
         grant_id: u64,
         funder: Address,
         amount: i128,
+        memo: Option<String>,
     ) -> Result<(), ContractError> {
         funder.require_auth();
         reentrancy::with_non_reentrant(&env, || {
@@ -1086,7 +1137,17 @@ impl StellarGrantsContract {
 
             Storage::set_grant(&env, grant_id, &grant);
 
-            Events::emit_grant_funded(&env, grant_id, funder, amount, grant.escrow_balance);
+            Events::emit_grant_funded(&env, grant_id, funder.clone(), amount, grant.escrow_balance);
+
+            // Emit a payer receipt for accounting / indexing.
+            Events::emit_payer_receipt(
+                &env,
+                grant_id,
+                funder,
+                grant.token,
+                amount,
+                memo,
+            );
 
             Ok(())
         })
@@ -1314,6 +1375,16 @@ impl StellarGrantsContract {
                     amount,
                     grant.escrow_balance,
                 );
+
+                // Emit a payer receipt for each individual batch deposit.
+                Events::emit_payer_receipt(
+                    &env,
+                    grant_id,
+                    funder.clone(),
+                    grant.token,
+                    amount,
+                    None, // batch fundings carry no per-item memo
+                );
             }
 
             Ok(())
@@ -1374,6 +1445,103 @@ impl StellarGrantsContract {
 
         Storage::remove_delegation(&env, &delegator, grant_id);
         Events::emit_delegation_revoked(&env, grant_id, delegator);
+        Ok(())
+    }
+
+    // ── Heartbeat ────────────────────────────────────────────
+
+    /// Signal that the project is still active. Must be called at least once every 30 days.
+    ///
+    /// - Updates [`Grant::last_heartbeat`] to the current ledger timestamp.
+    /// - If the previous `last_heartbeat` was more than 30 days ago the grant is
+    ///   automatically marked [`GrantStatus::Inactive`] and a [`GrantGoneInactive`] event
+    ///   is emitted; the owner can restore it only by calling `grant_ping` again,
+    ///   which flips it back to Active.
+    /// - Any funder may cancel an Inactive grant via [`Self::cancel_grant`].
+    /// - After 60 days of missed pings, ANYONE can cancel via [`Self::cancel_grant`].
+    ///
+    /// # Constants (seconds)
+    /// - `HEARTBEAT_WINDOW`: 30 days = 2_592_000 s
+    ///
+    /// # Errors
+    /// * [`ContractError::GrantNotFound`] – unknown grant.
+    /// * [`ContractError::Unauthorized`] – caller is not the grant owner.
+    /// * [`ContractError::InvalidState`] – grant is already Cancelled or Completed.
+    pub fn grant_ping(
+        env: Env,
+        grant_id: u64,
+        owner: Address,
+    ) -> Result<(), ContractError> {
+        owner.require_auth();
+        const HEARTBEAT_WINDOW: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+
+        let mut grant =
+            Storage::get_grant(&env, grant_id).ok_or(ContractError::GrantNotFound)?;
+
+        if grant.owner != owner {
+            return Err(ContractError::Unauthorized);
+        }
+
+        // Only Active or Inactive grants can receive pings.
+        if grant.status == GrantStatus::Cancelled || grant.status == GrantStatus::Completed {
+            return Err(ContractError::InvalidState);
+        }
+
+        let now = env.ledger().timestamp();
+        let prev_heartbeat = grant.last_heartbeat;
+
+        if prev_heartbeat > 0 && now > prev_heartbeat + HEARTBEAT_WINDOW {
+            // Heartbeat overdue — transition to Inactive (or stay Inactive).
+            if grant.status == GrantStatus::Active {
+                grant.status = GrantStatus::Inactive;
+                Events::emit_grant_gone_inactive(&env, grant_id, prev_heartbeat);
+            }
+        } else if grant.status == GrantStatus::Inactive {
+            // Within the grace window or owner calling early: restore to Active.
+            grant.status = GrantStatus::Active;
+        }
+
+        grant.last_heartbeat = now;
+        grant.timestamp = now;
+        Storage::set_grant(&env, grant_id, &grant);
+
+        Events::emit_heartbeat_updated(&env, grant_id, owner, now);
+        Ok(())
+    }
+
+    // ── Blacklist Management ────────────────────────────────────
+
+    /// Admin adds an address to the global blacklist.
+    pub fn admin_blacklist_add(
+        env: Env,
+        admin: Address,
+        bad_actor: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+        
+        // Ensure caller is the global admin.
+        if Storage::get_global_admin(&env) != Some(admin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        Storage::set_blacklisted(&env, &bad_actor);
+        Ok(())
+    }
+
+    /// Admin removes an address from the global blacklist.
+    pub fn admin_blacklist_remove(
+        env: Env,
+        admin: Address,
+        reformed_actor: Address,
+    ) -> Result<(), ContractError> {
+        admin.require_auth();
+
+        // Ensure caller is the global admin.
+        if Storage::get_global_admin(&env) != Some(admin) {
+            return Err(ContractError::Unauthorized);
+        }
+
+        Storage::remove_blacklisted(&env, &reformed_actor);
         Ok(())
     }
 }
